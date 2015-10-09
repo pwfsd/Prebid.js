@@ -1,5 +1,5 @@
 /* Prebid.js v0.3.2 
-Updated : 2015-09-29 */
+Updated : 2015-10-20 */
 (function e(t,n,r){function s(o,u){if(!n[o]){if(!t[o]){var a=typeof require=="function"&&require;if(!u&&a)return a(o,!0);if(i)return i(o,!0);throw new Error("Cannot find module '"+o+"'")}var f=n[o]={exports:{}};t[o][0].call(f.exports,function(e){var n=t[o][1][e];return s(n?n:e)},f,f.exports,e,t,n,r)}return n[o].exports}var i=typeof require=="function"&&require;for(var o=0;o<r.length;o++)s(r[o]);return s})({1:[function(require,module,exports){
 /** @module adaptermanger */
 
@@ -66,6 +66,7 @@ var bidfactory = require('../bidfactory.js');
 /* AppNexus bidder factory function
  *  Use to create a AppNexusAdapter object
  */
+ 
 
 var AppNexusAdapter = function AppNexusAdapter() {
 	var isCalled = false;
@@ -149,6 +150,7 @@ var AppNexusAdapter = function AppNexusAdapter() {
 		var placementId = utils.getBidIdParamater('placementId', bid.params);
 		var memberId = utils.getBidIdParamater('memberId', bid.params);
 		var inventoryCode = utils.getBidIdParamater('invCode', bid.params);
+		var query = utils.getBidIdParamater('query', bid.params);
 
 		//build our base tag, based on if we are http or https
 
@@ -173,10 +175,10 @@ var AppNexusAdapter = function AppNexusAdapter() {
 		}
 		//console.log(jptCall);
 
-		var targetingParams = '';
+		var targetingParams = utils.parseQueryStringParameters(query);
 
 		if (targetingParams) {
-			//don't append a & here, we have already done it at the end of the loop
+			//don't append a & here, we have already done it in parseQueryStringParameters
 			jptCall += targetingParams;
 		}
 
@@ -478,8 +480,6 @@ var CriteoAdapter = function CriteoAdapter() {
 						adResponse.bidderCode = 'criteo';
 
 						adResponse.keys = content.split(';');
-
-						bidmanager.addBidResponse(existingBid.placementCode, adResponse);
 					} else {
 						// Indicate an ad was not returned
 						adResponse = bidfactory.createBid(2);
@@ -520,6 +520,11 @@ var OpenxAdapter = function OpenxAdapter(options) {
 	var opts = options || {};
 	var scriptUrl;
 	var bids;
+  var bidsByAdUnitId = {};
+  var oxResponse;
+  var OX_RENDER_FN_NAME = 'ox_renderAd',
+      OX_CREATIVE_TAG_START = "<script type='text/javascript'>window.top.pbjs." + OX_RENDER_FN_NAME + "(window.frameElement, '",
+      OX_CREATIVE_TAG_END = "');</script>";
 
 	function _callBids(params) {
 		bids = params.bids || [];
@@ -542,61 +547,111 @@ var OpenxAdapter = function OpenxAdapter(options) {
 		_requestBids();
 	}
 
+  function _creative(adUnitId, adId) {
+    return OX_CREATIVE_TAG_START + adUnitId + "','" + adId + OX_CREATIVE_TAG_END;
+  }
+
+  function _createBidResponse(adUnit) {
+    var adResponse = adResponse = bidfactory.createBid(1);
+    adResponse.bidderCode = 'openx';
+    adResponse.ad_id = adUnit.get('ad_id');
+    adResponse.cpm = Number(adUnit.get('pub_rev')) / 1000;
+    adResponse.ad = _creative(adUnit.get('adunit_id'), adUnit.get('ad_id'));
+    adResponse.adUrl = adUnit.get('ad_url');
+    adResponse.width = adUnit.get('width');
+    adResponse.height = adUnit.get('height');
+    return adResponse;
+  }
+
+  function _createErrorResponse(adUnit) {
+    var adResponse = bidfactory.createBid(2);
+    adResponse.bidderCode = 'openx';
+    return adResponse;
+  }
+
+  // add the rendering function to the window;
+  // we need to do this because we have to render using the openx
+  // response that we received; by doing this we'll get the correct
+  // tracking pixels/creative payload from openx
+  function _bootstrapOpenX() {
+    window.pbjs = window.pbjs || {que: []};
+    window.pbjs[OX_RENDER_FN_NAME] = function (frameElement, adUnitId, adId) {
+      var bidResponses = bidsByAdUnitId[adUnitId];
+
+      if (!bidResponses) {
+        utils.logError('OPENX', 'ERROR', 'invalid adunitId returned in creative: ' + adUnitId);
+        return;
+      }
+
+      if (!oxResponse) {
+        utils.logError('OPENX creative rendered without response', 'ERROR');
+        return;
+      }
+
+      var adUnit = bidResponses[adId];
+      if (!adUnit) {
+        utils.logError('OPENX no adunit found for ad id: ' + adId, 'ERROR');
+        return;
+      }
+
+      // tell the adunit where to render;
+      // otherwise it will try to render in the parent (current)
+      // window
+      adUnit.set('anchor', frameElement);
+      oxResponse.showAdUnit(parseInt(adUnitId));
+    };
+  }
+
 	function _requestBids() {
 
-		if (scriptUrl) {
-			adloader.loadScript(scriptUrl, function() {
-				var i;
-				var POX = OX();
+    if (!scriptUrl) {
+      utils.logError('OPENX - no script url given!', 'ERROR');
+      return;
+    }
 
-				POX.setPageURL(opts.pageURL);
-				POX.setRefererURL(opts.refererURL);
-				POX.addPage(opts.pgid);
+    adloader.loadScript(scriptUrl, function() {
+      var POX = OX();
 
-				// Add each ad unit ID
-				for (i = 0; i < bids.length; i++) {
-					POX.addAdUnit(bids[i].params.unit);
-				}
+      POX.frameCreatives(false);
+      POX.setPageURL(opts.pageURL);
+      POX.setRefererURL(opts.refererURL);
+      POX.addPage(opts.pgid);
 
-				POX.addHook(function(response) {
-					var i;
-					var bid;
-					var adUnit;
-					var adResponse;
+      utils._each(bids, function (bid) {
+        POX.addAdUnit(bid.params.unit);
+      });
 
-					// Map each bid to its response
-					for (i = 0; i < bids.length; i++) {
-						bid = bids[i];
+      _bootstrapOpenX();
 
-						// Get ad response
-						adUnit = response.getOrCreateAdUnit(bid.params.unit);
+      POX.addHook(function(response) {
+        oxResponse = response;
 
-						// If 'pub_rev' (CPM) isn't returned we got an empty response
-						if (adUnit.get('pub_rev')) {
-							adResponse = adResponse = bidfactory.createBid(1);
+        utils._each(bids, function (bid) {
+          var adUnit = response.getOrCreateAdUnit(bid.params.unit),
+              adUnitId = adUnit.get('adunit_id') + '';
 
-							adResponse.bidderCode = 'openx';
-							adResponse.ad_id = adUnit.get('ad_id');
-							adResponse.cpm = Number(adUnit.get('pub_rev')) / 1000;
-							adResponse.ad = adUnit.get('html');
-							adResponse.adUrl = adUnit.get('ad_url');
-							adResponse.width = adUnit.get('width');
-							adResponse.height = adUnit.get('height');
 
-							bidmanager.addBidResponse(bid.placementCode, adResponse);
-						} else {
-							// Indicate an ad was not returned
-							adResponse = bidfactory.createBid(2);
-							adResponse.bidderCode = 'openx';
-							bidmanager.addBidResponse(bid.placementCode, adResponse);
-						}
-					}
-				}, OX.Hooks.ON_AD_RESPONSE);
+          // we support multiple bids for the same ad unit id
+          // this is how we're going to actually render the ad
+          bidsByAdUnitId[adUnitId] = bidsByAdUnitId[adUnitId] || {};
+          bidsByAdUnitId[adUnitId][adUnit.get('ad_id') + ''] = adUnit;
 
-				// Make request
-				POX.load();
-			});
-		}
+          var adResponse;
+          if (adUnit.get('pub_rev')) {
+            adResponse = _createBidResponse(bid, adUnit);
+          } else {
+            adResponse = _createErrorResponse(bid, adUnit);
+          }
+
+          bidmanager.addBidResponse(bid.placementCode, adResponse);
+        });
+
+      }, OX.Hooks.ON_AD_RESPONSE);
+
+      // Make request
+      POX.load();
+    });
+
 	}
 
 	return {
@@ -605,6 +660,7 @@ var OpenxAdapter = function OpenxAdapter(options) {
 };
 
 module.exports = OpenxAdapter;
+
 },{"../adloader":9,"../bidfactory.js":10,"../bidmanager.js":11,"../constants.json":12,"../utils.js":14}],6:[function(require,module,exports){
 var CONSTANTS = require('../constants.json');
 var utils = require('../utils.js');
@@ -1331,10 +1387,12 @@ function getKeyValueTargetingPairs(bidderCode, custBidObj) {
 	if (bidderCode && custBidObj && bidder_settings && bidder_settings[bidderCode]) {
 		//
 		setKeys(keyValues, bidder_settings[bidderCode], custBidObj);
+		custBidObj.alwaysUseBid = bidder_settings[bidderCode].alwaysUseBid;
 	}
 	//next try with defaultBidderSettings
 	else if (defaultBidderSettingsMap[bidderCode]) {
 		setKeys(keyValues, defaultBidderSettingsMap[bidderCode], custBidObj);
+		custBidObj.alwaysUseBid = defaultBidderSettingsMap[bidderCode].alwaysUseBid;
 	}
 	//now try with "generic" settings
 	else if (custBidObj && bidder_settings) {
@@ -1364,8 +1422,6 @@ function getKeyValueTargetingPairs(bidderCode, custBidObj) {
 				}]
 			};
 		}
-
-		custBidObj.usesGenericKeys = true;
 		setKeys(keyValues, bidder_settings[CONSTANTS.JSON_MAPPING.BD_SETTING_STANDARD], custBidObj);
 	}
 
@@ -1425,10 +1481,14 @@ exports.executeCallback = function() {
 
 	//execute one time callback
 	if(externalOneTimeCallback){
-		processCallbacks(externalOneTimeCallback);
+		var params = [];
+		var responseObj = pbjs.getBidResponses();
+		params.push(responseObj);
+
+		processCallbacks(externalOneTimeCallback,params);
 		externalOneTimeCallback = null;
 	}
-	
+
 };
 
 exports.allBidsBack = function() {
@@ -1442,16 +1502,17 @@ function triggerAdUnitCallbacks(adUnitCode){
 }
 
 function processCallbacks(callbackQueue, params){
-		var i;
-		if(utils.isArray(callbackQueue)){
-			for(i = 0; i < callbackQueue.length; i++){
-				var func = callbackQueue[i];
-				callFunction(func, params);
-			}
+	var i;
+	if(utils.isArray(callbackQueue)){
+		for(i = 0; i < callbackQueue.length; i++){
+			var func = callbackQueue[i];
+			callFunction(func, params);
 		}
-		else{
-			callFunction(callbackQueue, params);
-		}		
+	}
+	else{
+		callFunction(callbackQueue, params);
+	}
+
 }
 
 function callFunction(func, args){
@@ -1463,7 +1524,7 @@ function callFunction(func, args){
 		catch(e){
 			utils.logError('Error executing callback function: ' + e.message);
 		}
-	}	
+	}
 }
 
 function checkBidsBackByAdUnit(adUnitCode){
@@ -1474,7 +1535,7 @@ function checkBidsBackByAdUnit(adUnitCode){
 			//all bids back for ad unit
 			if(bidsBack === adUnit.bids.length){
 				triggerAdUnitCallbacks(adUnitCode);
-				
+
 			}
 		}
 	}
@@ -1496,12 +1557,12 @@ exports.checkIfAllBidsAreIn = function(adUnitCode) {
 
 	//check by ad units
 	checkBidsBackByAdUnit(adUnitCode);
-	
+
 
 	if (_allBidsAvailable) {
 		//execute our calback method if it exists && pbjs.initAdserverSet !== true
 		this.executeCallback();
-		
+
 	}
 };
 
@@ -1522,7 +1583,7 @@ exports.addCallback = function(id, callback, cbEvent){
 		externalCallbackByAdUnitArr.push(callback);
 	}
 
-	
+
 };
 
 },{"./constants.json":12,"./utils.js":14}],12:[function(require,module,exports){
@@ -1628,7 +1689,7 @@ function init(timeout, adUnitCodeArr) {
 	else{
 		cbTimeout = timeout;
 	}
-	
+
 	if (!isValidAdUnitSetting()) {
 		utils.logMessage('No adUnits configured. No bids requested.');
 		return;
@@ -1757,12 +1818,14 @@ function setGPTAsyncTargeting(code, slot, adUnitBids) {
 		for (var i = 0; i < adUnitBids.bids.length; i++) {
 			var bid = adUnitBids.bids[i];
 			//if use the generic key push into array with CPM for sorting
-			if (bid.usesGenericKeys) {
+			if (!bid.alwaysUseBid) {
 				bidArrayTargeting.push({
 					cpm: bid.cpm,
 					bid: bid
 				});
-			} else {
+			}
+			// alwaysUseBid = true - send the bid anyway
+			else {
 				var keyStrings = adUnitBids.bids[i].adserverTargeting;
 				for (var key in keyStrings) {
 					if (keyStrings.hasOwnProperty(key)) {
@@ -1828,20 +1891,24 @@ function getBidResponsesByAdUnit(adunitCode) {
  */
 function buildBidResponse(bidArray) {
 	var bidResponseArray = [];
+	var adUnitCode = '';
 	//temp array to hold auction for bids
 	var bidArrayTargeting = [];
 	var bidClone = {};
 	if (bidArray) {
+		// init the pb_targetingMap for the adUnitCode
+		adUnitCode = bidArray[0] && bidArray[0].adUnitCode;
+		pb_targetingMap[adUnitCode] = [];
 		for (var i = 0; i < bidArray.length; i++) {
 			var bid = bidArray[i];
 			//clone by json parse. This also gets rid of unwanted function properties
 			bidClone = getCloneBid(bid);
 
-			if (!bid.usesGenericKeys) {
-				//put unique key into targeting
-				pb_targetingMap[bidClone.adUnitCode] = bidClone.adserverTargeting;
-			} else {
-				//else put into auction array
+			if (bid.alwaysUseBid && bidClone.adserverTargeting) { // add the bid if alwaysUse and bid has returned
+				// push key into targeting
+				pb_targetingMap[bidClone.adUnitCode].push(bidClone.adserverTargeting);
+			} else if (bid.cpm && bid.cpm > 0){
+				//else put into auction array if cpm > 0
 				bidArrayTargeting.push({
 					cpm: bid.cpm,
 					bid: bid
@@ -1852,10 +1919,11 @@ function buildBidResponse(bidArray) {
 		}
 	}
 
-	if (bidArrayTargeting.length !== 0) {
+	// push the winning bid into targeting map
+	if (adUnitCode && bidArrayTargeting.length !== 0) {
 		var winningBid = getWinningBid(bidArrayTargeting);
 		var keyValues = winningBid.adserverTargeting;
-		pb_targetingMap[bidClone.adUnitCode] = keyValues;
+		pb_targetingMap[adUnitCode].push(keyValues);
 	}
 
 	return bidResponseArray;
@@ -1893,7 +1961,18 @@ function requestAllBids(tmout){
 //		Start Public APIs		//
 // 								//
 //////////////////////////////////
+/**
+ * This function returns the query string targeting parameters available at this moment for a given ad unit. Note that some bidder's response may not have been received if you call this function too quickly after the requests are sent.
+ * @param  {string} [adunitCode] adUnitCode to get the bid responses for
+ * @alias module:pbjs.getAdserverTargetingForAdUnitCodeStr
+ * @return {array}	returnObj return bids array
+ */
+pbjs.getAdserverTargetingForAdUnitCodeStr = function(adunitCode) {
+	// call to retrieve bids array
+	var res = pbjs.getAdserverTargetingForAdUnitCode(adunitCode);
+	return utils.transformAdServerTargetingObj(res);
 
+};
 /**
  * This function returns the query string targeting parameters available at this moment for a given ad unit. Note that some bidder's response may not have been received if you call this function too quickly after the requests are sent.
  * @param  {string} [adunitCode] adUnitCode to get the bid responses for
@@ -1975,11 +2054,11 @@ pbjs.getBidResponsesForAdUnitCode = function(adUnitCode) {
 };
 /**
  * Set query string targeting on adUnits specified. The logic for deciding query strings is described in the section Configure AdServer Targeting. Note that this function has to be called after all ad units on page are defined.
- * @param {array} [codeArr] an array of adUnitodes to set targeting for. 
+ * @param {array} [codeArr] an array of adUnitodes to set targeting for.
  * @alias module:pbjs.setTargetingForAdUnitsGPTAsync
  */
 pbjs.setTargetingForAdUnitsGPTAsync = function(codeArr) {
-	if (!window.googletag || !window.googletag.pubads() || !window.googletag.pubads().getSlots()) {
+	if (!window.googletag || !utils.isFn(window.googletag.pubads) || !utils.isFn(window.googletag.pubads().getSlots)) {
 		utils.logError('window.googletag is not defined on the page');
 		return;
 	}
@@ -2024,7 +2103,7 @@ pbjs.setTargetingForAdUnitsGPTAsync = function(codeArr) {
  * Set query string targeting on all GPT ad units.
  * @alias module:pbjs.setTargetingForGPTAsync
  */
-pbjs.setTargetingForGPTAsync = function() {		
+pbjs.setTargetingForGPTAsync = function() {
 	pbjs.setTargetingForAdUnitsGPTAsync();
 };
 
@@ -2134,12 +2213,12 @@ pbjs.removeAdUnit = function(adUnitCode) {
 
 
 /**
- * Request bids ad-hoc. This function does not add or remove adUnits already configured. 
- * @param  {Object} requestObj 
+ * Request bids ad-hoc. This function does not add or remove adUnits already configured.
+ * @param  {Object} requestObj
  * @param {string[]} requestObj.adUnitCodes  adUnit codes to request. Use this or requestObj.adUnits
  * @param {object[]} requestObj.adUnits AdUnitObjects to request. Use this or requestObj.adUnitCodes
  * @param {number} [requestObj.timeout] Timeout for requesting the bids specified in milliseconds
- * @param {function} [requestObj.bidsBackHandler] Callback to execute when all the bid responses are back or the timeout hits. 
+ * @param {function} [requestObj.bidsBackHandler] Callback to execute when all the bid responses are back or the timeout hits.
  * @alias module:pbjs.requestBids
  */
 pbjs.requestBids = function(requestObj) {
@@ -2175,12 +2254,12 @@ pbjs.requestBids = function(requestObj) {
 
 		pbjs.adUnits = adUnitBackup;
 	}
-	
+
 };
 
 /**
- * 
- * Add adunit(s) 
+ *
+ * Add adunit(s)
  * @param {(string|string[])} Array of adUnits or single adUnit Object.
  * @alias module:pbjs.addAdUnits
  */
@@ -2242,6 +2321,7 @@ var _hgPriceCap = 20.00;
 var t_Arr = 'Array',
     t_Str = 'String',
     t_Fn = 'Function',
+    toString = Object.prototype.toString,
     hasOwnProperty = Object.prototype.hasOwnProperty,
     slice = Array.prototype.slice;
 
@@ -2294,6 +2374,34 @@ exports.tryAppendQueryString = function(existingUrl, key, value) {
 		return existingUrl += key + '=' + encodeURIComponent(value) + '&';
 	}
 	return existingUrl;
+};
+
+
+//parse a query string object passed in bid params
+//bid params should be an object such as {key: "value", key1 : "value1"}
+exports.parseQueryStringParameters = function(queryObj) {
+	var result = "";
+	for (var k in queryObj){
+		if (queryObj.hasOwnProperty(k))
+			result += k + "=" + encodeURIComponent(queryObj[k]) + "&";
+	}
+	return result;
+};
+
+
+//transform an array of AdServer targeting bids into a query string to send to the adserver
+//bid params should be an object such as {key: "value", key1 : "value1"}
+exports.transformAdServerTargetingObj = function(adServerTargetingAr) {
+	var result = "";
+	if (!adServerTargetingAr)
+		return "";
+	for (var i = 0; i < adServerTargetingAr.length; ++i){
+		AdserverTargetingObj = adServerTargetingAr[i];
+		for (var k in AdserverTargetingObj)
+			if (AdserverTargetingObj.hasOwnProperty(k))
+				result += k + "=" + encodeURIComponent(AdserverTargetingObj[k]) + "&";
+	}
+	return result;
 };
 
 //parse a GPT-Style General Size Array or a string like "300x250" into a format
@@ -2391,7 +2499,7 @@ var errLogFn = (function (hasLogger) {
 
 var debugTurnedOn = function() {
 	if (pbjs.logging === false && _loggingChecked === false) {
-		pbjs.logging = !!getParameterByName(CONSTANTS.DEBUG_MODE);
+		pbjs.logging = getParameterByName(CONSTANTS.DEBUG_MODE).toUpperCase() === 'TRUE';
 		_loggingChecked = true;
 	}
 
@@ -2486,7 +2594,7 @@ exports.getPriceBucketString = function(cpm) {
 };
 
 /**
- * This function validates paramaters. 
+ * This function validates paramaters.
  * @param  {object[string]} paramObj          [description]
  * @param  {string[]} requiredParamsArr [description]
  * @return {bool}                   Bool if paramaters are valid
