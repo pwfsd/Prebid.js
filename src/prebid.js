@@ -9,6 +9,8 @@ var bidmanager = require('./bidmanager.js');
 var adaptermanager = require('./adaptermanager');
 var bidfactory = require('./bidfactory');
 var adloader = require('./adloader');
+var ga = require('./ga');
+var events = require('./events');
 
 /* private variables */
 
@@ -17,11 +19,14 @@ var objectType_undefined = 'undefined';
 var objectType_object = 'object';
 var objectType_string = 'string';
 var objectType_number = 'number';
+var BID_WON = CONSTANTS.EVENTS.BID_WON;
+var BID_TIMEOUT = CONSTANTS.EVENTS.BID_TIMEOUT;
 
 var pb_preBidders = [],
 	pb_placements = [],
 	pb_bidderMap = {},
-	pb_targetingMap = {};
+	pb_targetingMap = {},
+	pb_keyHistoryMap = {};
 
 
 /* Public vars */
@@ -55,8 +60,14 @@ pbjs.que.push = function(cmd) {
 function processQue() {
 	for (var i = 0; i < pbjs.que.length; i++) {
 		if (typeof pbjs.que[i].called === objectType_undefined) {
-			pbjs.que[i].call();
-			pbjs.que[i].called = true;
+			try{
+				pbjs.que[i].call();
+				pbjs.que[i].called = true;
+			}
+			catch(e){
+				utils.logError('Error processing command :', 'prebid.js', e);
+			}
+			
 		}
 	}
 }
@@ -84,12 +95,12 @@ function init(timeout, adUnitCodeArr) {
 		for (var k = 0; k < adUnitCodeArr.length; k++) {
 			for (var i = 0; i < pbjs.adUnits.length; i++) {
 				if (pbjs.adUnits[i].code === adUnitCodeArr[k]) {
-					pb_placements = [pbjs.adUnits[i]];
+					pb_placements.push(pbjs.adUnits[i]);
 				}
 			}
-			loadPreBidders();
-			sortAndCallBids();
 		}
+		loadPreBidders();
+		sortAndCallBids();
 	} else {
 		pb_placements = pbjs.adUnits;
 		//Aggregrate prebidders by their codes
@@ -97,7 +108,6 @@ function init(timeout, adUnitCodeArr) {
 		//sort and call // default no sort
 		sortAndCallBids();
 	}
-
 }
 
 function isValidAdUnitSetting() {
@@ -197,7 +207,13 @@ function getWinningBid(bidArray) {
 function setGPTAsyncTargeting(code, slot) {
 	//get the targeting that is already configured
 	var keyStrings = getTargetingfromGPTIdentifier(slot);
-	slot.clearTargeting();
+	//copy keyStrings into pb_keyHistoryMap
+	utils.extend(pb_keyHistoryMap, keyStrings);
+	utils._each(pb_keyHistoryMap, function(value, key){
+		//since DFP doesn't support deleting a single key, we will set all to empty string
+		//This is "clear" for that key
+		slot.setTargeting(key, '');
+	});
 	for (var key in keyStrings) {
 		if (keyStrings.hasOwnProperty(key)) {
 			try {
@@ -287,6 +303,8 @@ function getCloneBid(bid) {
 function resetBids() {
 	bidmanager.clearAllBidResponses();
 	pb_bidderMap = {};
+	pb_placements = [];
+	pb_targetingMap = {};
 }
 
 function requestAllBids(tmout){
@@ -403,6 +421,10 @@ pbjs.setTargetingForAdUnitsGPTAsync = function(codeArr) {
 		return;
 	}
 
+	//emit bid timeout event here 
+	var timedOutBidders = bidmanager.getTimedOutBidders();
+	events.emit(BID_TIMEOUT, timedOutBidders);
+
 	var adUnitCodesArr = codeArr;
 
 	if (typeof codeArr === objectType_string) {
@@ -490,6 +512,8 @@ pbjs.renderAd = function(doc, id) {
 			//lookup ad by ad Id
 			var adObject = bidmanager._adResponsesByBidderId[id];
 			if (adObject) {
+				//emit 'bid won' event here
+				events.emit(BID_WON, adObject);
 				var height = adObject.height;
 				var width = adObject.width;
 				var url = adObject.adUrl;
@@ -737,8 +761,96 @@ pbjs.loadScript = function(tagSrc, callback){
 	adloader.loadScript(tagSrc, callback);
 };
 
-processQue();
+/**
+ * This isn't ready yet
+ * return data for analytics
+ * @param  {Function}  [description]
+ * @return {[type]}    [description]
+ 
+pbjs.getAnalyticsData = function(){
+	var returnObj = {};
+	var bidResponses = pbjs.getBidResponses();
 
+	//create return obj for all adUnits
+	for(var i=0;i<pbjs.adUnits.length;i++){
+		var allBids = pbjs.adUnits[i].bids;
+		for(var j=0;j<allBids.length;j++){
+			var bid = allBids[j];
+			if(typeof returnObj[bid.bidder] === objectType_undefined){
+				returnObj[bid.bidder] = {};
+				returnObj[bid.bidder].bids = [];
+			}
+
+			var returnBids = returnObj[bid.bidder].bids;
+			var returnBidObj = {};
+			returnBidObj.timeout = true;
+			returnBids.push(returnBidObj);
+		}
+	}
+
+	utils._each(bidResponses,function(responseByUnit, adUnitCode){
+		var bids = responseByUnit.bids;
+
+		for(var i=0; i<bids.length; i++){
+
+			var bid = bids[i];
+			if(bid.bidderCode!==''){
+				var returnBids = returnObj[bid.bidderCode].bids;
+				var returnIdx = 0;
+				
+				for(var j=0;j<returnBids.length;j++){
+					if(returnBids[j].timeout)
+						returnIdx = j;
+				}
+
+				var returnBidObj = {};
+
+				returnBidObj.cpm = bid.cpm;
+				returnBidObj.timeToRespond = bid.timeToRespond;
+
+				//check winning
+				if(pb_targetingMap[adUnitCode].hb_adid === bid.adId){
+					returnBidObj.win = true;
+				}else{
+					returnBidObj.win = false;
+				}
+
+				returnBidObj.timeout = false;
+				returnBids[returnIdx] = returnBidObj;
+			}
+		}
+	});
+
+	return returnObj;
+};
+
+*/
+
+/**
+ * Will enable sendinga prebid.js to data provider specified
+ * @param  {object} options object {provider : 'string', options : {}}
+ */
+pbjs.enableAnalytics = function(options){
+	if(!options){
+		utils.logError('pbjs.enableAnalytics should be called with option {}', 'prebid.js');
+		return;
+	}
+
+	if(options.provider === 'ga'){
+		try{
+			ga.enableAnalytics(typeof options.options === 'undefined' ? {} :options.options ) ;
+		}
+		catch(e){
+			utils.logError('Error calling GA: ', 'prebid.js', e);
+		}	
+	}
+	else if(options.provider === 'other_provider'){
+		//todo
+	}
+};
+
+
+processQue();
 
 //only for test
 pbjs_testonly = {};
